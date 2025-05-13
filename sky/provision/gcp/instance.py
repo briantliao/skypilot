@@ -270,7 +270,7 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
         if resumed_instance_ids:
             resumed_instance_ids = resource.start_instances(
                 cluster_name_on_cloud, project_id, availability_zone,
-                resumed_instance_ids, labels)
+                config.node_config, resumed_instance_ids, labels)
         # In MIG case, the resumed_instance_ids will include the previously
         # PENDING and RUNNING instances. To avoid double counting, we need to
         # remove them from the resumed_instance_ids.

@@ -3,11 +3,15 @@ import copy
 import enum
 import functools
 from multiprocessing import pool
+import os
 import re
 import subprocess
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
+
+from googleapiclient import discovery
+from googleapiclient.errors import HttpError
 
 from sky import sky_logging
 from sky.adaptors import gcp
@@ -16,6 +20,7 @@ from sky.provision import common
 from sky.provision import constants as provision_constants
 from sky.provision.gcp import constants
 from sky.provision.gcp import mig_utils
+from sky.skylet import log_lib
 from sky.utils import common_utils
 from sky.utils import ux_utils
 
@@ -254,8 +259,8 @@ class GCPInstance:
 
     @classmethod
     def start_instances(cls, cluster_name: str, project_id: str, zone: str,
-                        instances: List[str], labels: Dict[str,
-                                                           str]) -> List[str]:
+                        node_config: dict, instances: List[str],
+                        labels: Dict[str, str]) -> List[str]:
         """Start multiple instances.
 
         Returns:
@@ -264,6 +269,7 @@ class GCPInstance:
         del cluster_name  # Unused
         for instance_id in instances:
             cls.start_instance(instance_id, project_id, zone)
+            cls.resize_disk(project_id, zone, node_config, instance_id)
             cls.set_labels(project_id, zone, instance_id, labels)
         return instances
 
@@ -1627,13 +1633,111 @@ class GCPTPUVMInstance(GCPInstance):
     @classmethod
     def resize_disk(cls, project_id: str, availability_zone: str,
                     node_config: dict, instance_name: str) -> None:
-        """Resize the disk a machine image with a different size is used.
+        """Resizes disk for TPU VMs by adding a persistent disk when needed."""
+        resource = discovery.build('compute', 'v1')
 
-        TODO: Implement the feature to attach persistent disks for TPU VMs.
-        The boot disk of TPU VMs is not resizable, and users need to add a
-        persistent disk to expand disk capacity. Related issue: #2387
+        # Determine the required disk size from configuration
+        default_disk_size = 100  # Default boot disk size for TPUVMs
+        requested_size = int(node_config['metadata'].get(
+            'diskSize', default_disk_size))
+
+        if requested_size <= default_disk_size:
+            logger.warning(
+                'TPU VM disk size cannot be smaller than the default size. '
+                'No resizing needed.')
+            return
+
+        # Calculate additional disk size needed
+        additional_size = requested_size - default_disk_size
+
+        # Log the disk size request
+        logger.info('Requesting additional persistent disk of size: '
+                    f'{additional_size}GB')
+
+        # Set disk specifications
+        tpu_name = instance_name.split('/')[-1]
+        disk_name = f'{tpu_name}-extra-disk'
+        disk_type = f'zones/{availability_zone}/diskTypes/pd-standard'
+
+        # Prepare the disk creation body
+        disk_body = {
+            'name': disk_name,
+            'sizeGb': str(additional_size),
+            'type': disk_type,
+        }
+
+        # Create the disk
+        try:
+            resource.disks().insert(project=project_id,
+                                    zone=availability_zone,
+                                    body=disk_body).execute()
+            time.sleep(3)  # Short pause after disk creation
+        except HttpError as e:
+            logger.warning(f'Disk creation failed: {e.reason}')
+            return
+
+        # Attach the newly created disk
+        attach_command = (
+            f'gcloud alpha compute tpus tpu-vm attach-disk {tpu_name} '
+            f'--zone {availability_zone} --disk {disk_name} --mode read-write')
+        if cls._execute_command_with_log(attach_command) != 0:
+            logger.warning('Failed to attach disk to TPU VMs.')
+            return
+
+        # Format the disk
+        format_command = cls._create_ssh_command(
+            tpu_name, availability_zone,
+            ('sudo mkfs.ext4 -m 0 -E '
+             'lazy_itable_init=0,lazy_journal_init=0,discard /dev/sdb'))
+        if cls._execute_command_with_log(format_command) != 0:
+            logger.warning('Failed to format persistent disk.')
+            return
+
+        # Make the mount point directory
+        mkdir_command = cls._create_ssh_command(
+            tpu_name, availability_zone, 'sudo mkdir -p /mnt/disks/persist')
+        if cls._execute_command_with_log(mkdir_command) != 0:
+            logger.warning('Failed to create mount point directory.')
+            return
+
+        # Mount the disk
+        mount_command = cls._create_ssh_command(
+            tpu_name, availability_zone,
+            'sudo mount -o discard,defaults /dev/sdb /mnt/disks/persist')
+        if cls._execute_command_with_log(mount_command) != 0:
+            logger.warning('Failed to mount persistent disk.')
+            return
+
+        logger.info('Successfully attached and formatted additional '
+                    f'persistent disk of size {additional_size}GB'
+                    f'to TPU VM {tpu_name}.')
+
+    @classmethod
+    def _create_ssh_command(cls, tpu_name: str, availability_zone: str,
+                            command: str) -> str:
+        """Creates a command to SSH into the TPU VM."""
+        escaped_command = command.replace('"', '\\"')
+        return (f'gcloud compute tpus tpu-vm ssh {tpu_name} '
+                f'--zone={availability_zone} '
+                f'--command="{escaped_command}"')
+
+    @classmethod
+    def _execute_command_with_log(cls, command: str) -> int:
+        """Executes a shell command and logs the output,
+        returning the return code.
         """
-        return
+        rcode, stdout, stderr = log_lib.run_with_log(
+            command,
+            os.devnull,
+            shell=True,
+            stream_logs=False,
+            require_outputs=True,
+        )
+        if rcode != 0:
+            logger.warning(
+                f'Command failed.\n**** STDOUT ****\n{stdout}\n**** STDERR ****'
+                f'\n{stderr}')
+        return rcode
 
     @classmethod
     def get_instance_info(cls, project_id: str, availability_zone: str,
