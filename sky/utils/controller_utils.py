@@ -2,11 +2,10 @@
 import copy
 import dataclasses
 import enum
-import getpass
 import os
 import tempfile
 import typing
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 import uuid
 
 import colorama
@@ -24,6 +23,7 @@ from sky.clouds import gcp
 from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.jobs import constants as managed_job_constants
+from sky.provision.kubernetes import constants as kubernetes_constants
 from sky.serve import constants as serve_constants
 from sky.setup_files import dependencies
 from sky.skylet import constants
@@ -64,7 +64,7 @@ class _ControllerSpec:
     controller_type: str
     name: str
     cluster_name: str
-    in_progress_hint: str
+    in_progress_hint: Callable[[bool], str]
     decline_cancel_hint: str
     _decline_down_when_failed_to_fetch_status_hint: str
     decline_down_for_dirty_controller_hint: str
@@ -94,9 +94,9 @@ class Controllers(enum.Enum):
         controller_type='jobs',
         name='managed jobs controller',
         cluster_name=common.JOB_CONTROLLER_NAME,
-        in_progress_hint=(
-            '* {job_info}To see all managed jobs: '
-            f'{colorama.Style.BRIGHT}sky jobs queue{colorama.Style.RESET_ALL}'),
+        in_progress_hint=lambda _:
+        ('* {job_info}To see all managed jobs: '
+         f'{colorama.Style.BRIGHT}sky jobs queue{colorama.Style.RESET_ALL}'),
         decline_cancel_hint=(
             'Cancelling the jobs controller\'s jobs is not allowed.\nTo cancel '
             f'managed jobs, use: {colorama.Style.BRIGHT}sky jobs cancel '
@@ -126,8 +126,11 @@ class Controllers(enum.Enum):
         name='serve controller',
         cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
         in_progress_hint=(
-            f'* To see detailed service status: {colorama.Style.BRIGHT}'
-            f'sky serve status -v{colorama.Style.RESET_ALL}'),
+            lambda pool:
+            (f'* To see detailed pool status: {colorama.Style.BRIGHT}'
+             f'sky jobs pool status -v{colorama.Style.RESET_ALL}') if pool else
+            (f'* To see detailed service status: {colorama.Style.BRIGHT}'
+             f'sky serve status -v{colorama.Style.RESET_ALL}')),
         decline_cancel_hint=(
             'Cancelling the sky serve controller\'s jobs is not allowed.'),
         _decline_down_when_failed_to_fetch_status_hint=(
@@ -206,8 +209,7 @@ class Controllers(enum.Enum):
         return None
 
 
-def high_availability_specified(cluster_name: Optional[str],
-                                skip_warning: bool = True) -> bool:
+def high_availability_specified(cluster_name: Optional[str]) -> bool:
     """Check if the controller high availability is specified in user config.
     """
     controller = Controllers.from_name(cluster_name)
@@ -215,18 +217,9 @@ def high_availability_specified(cluster_name: Optional[str],
         return False
 
     if skypilot_config.loaded():
-        high_availability = skypilot_config.get_nested(
-            (controller.value.controller_type, 'controller',
-             'high_availability'), False)
-        if high_availability:
-            if controller.value.controller_type != 'serve':
-                if not skip_warning:
-                    print(f'{colorama.Fore.RED}High availability controller is'
-                          'only supported for SkyServe controller. It cannot'
-                          f'be enabled for {controller.value.name}.'
-                          f'Skipping this flag.{colorama.Style.RESET_ALL}')
-            else:
-                return True
+        return skypilot_config.get_nested((controller.value.controller_type,
+                                           'controller', 'high_availability'),
+                                          False)
     return False
 
 
@@ -263,6 +256,13 @@ def _get_cloud_dependencies_installation_commands(
         sky_check.get_cached_enabled_clouds_or_refresh(
             sky_cloud.CloudCapability.STORAGE))
     enabled_clouds = enabled_compute_clouds.union(enabled_storage_clouds)
+    enabled_k8s_and_ssh = [
+        repr(cloud)
+        for cloud in enabled_clouds
+        if isinstance(cloud, clouds.Kubernetes)
+    ]
+    k8s_and_ssh_label = ' and '.join(sorted(enabled_k8s_and_ssh))
+    k8s_dependencies_installed = False
 
     for cloud in enabled_clouds:
         cloud_python_dependencies: List[str] = copy.deepcopy(
@@ -282,10 +282,33 @@ def _get_cloud_dependencies_installation_commands(
             step_prefix = prefix_str.replace('<step>', str(len(commands) + 1))
             commands.append(f'echo -en "\\r{step_prefix}GCP SDK{empty_str}" &&'
                             f'{gcp.GOOGLE_SDK_INSTALLATION_COMMAND}')
-        elif isinstance(cloud, clouds.Kubernetes):
+            if clouds.cloud_in_iterable(clouds.Kubernetes(), enabled_clouds):
+                # Install gke-gcloud-auth-plugin used for exec-auth with GKE.
+                # We install the plugin here instead of the next elif branch
+                # because gcloud is required to install the plugin, so the order
+                # of command execution is critical.
+
+                # We install plugin here regardless of whether exec-auth is
+                # actually used as exec-auth may be used in the future.
+                # TODO (kyuds): how to implement conservative installation?
+                commands.append(
+                    '(command -v gke-gcloud-auth-plugin &>/dev/null || '
+                    '(gcloud components install gke-gcloud-auth-plugin --quiet &>/dev/null))')  # pylint: disable=line-too-long
+        elif isinstance(cloud, clouds.Nebius):
             step_prefix = prefix_str.replace('<step>', str(len(commands) + 1))
             commands.append(
-                f'echo -en "\\r{step_prefix}Kubernetes{empty_str}" && '
+                f'echo -en "\\r{step_prefix}Nebius{empty_str}" && '
+                'curl -sSL https://storage.eu-north1.nebius.cloud/cli/install.sh '  # pylint: disable=line-too-long
+                '| sudo NEBIUS_INSTALL_FOLDER=/usr/local/bin bash &> /dev/null && '
+                'nebius profile create --profile sky '
+                '--endpoint api.nebius.cloud '
+                '--service-account-file $HOME/.nebius/credentials.json '
+                '&> /dev/null || echo "Unable to create Nebius profile."')
+        elif (isinstance(cloud, clouds.Kubernetes) and
+              not k8s_dependencies_installed):
+            step_prefix = prefix_str.replace('<step>', str(len(commands) + 1))
+            commands.append(
+                f'echo -en "\\r{step_prefix}{k8s_and_ssh_label}{empty_str}" && '
                 # Install k8s + skypilot dependencies
                 'sudo bash -c "if '
                 '! command -v curl &> /dev/null || '
@@ -305,7 +328,10 @@ def _get_cloud_dependencies_installation_commands(
                 '(curl -s -LO "https://dl.k8s.io/release/v1.31.6'
                 '/bin/linux/$ARCH/kubectl" && '
                 'sudo install -o root -g root -m 0755 '
-                'kubectl /usr/local/bin/kubectl))')
+                'kubectl /usr/local/bin/kubectl)) && '
+                f'echo -e \'#!/bin/bash\\nexport PATH="{kubernetes_constants.SKY_K8S_EXEC_AUTH_PATH}"\\nexec "$@"\' | sudo tee /usr/local/bin/{kubernetes_constants.SKY_K8S_EXEC_AUTH_WRAPPER} > /dev/null && '  # pylint: disable=line-too-long
+                f'sudo chmod +x /usr/local/bin/{kubernetes_constants.SKY_K8S_EXEC_AUTH_WRAPPER}')  # pylint: disable=line-too-long
+            k8s_dependencies_installed = True
         elif isinstance(cloud, clouds.Cudo):
             step_prefix = prefix_str.replace('<step>', str(len(commands) + 1))
             commands.append(
@@ -368,10 +394,11 @@ def check_cluster_name_not_controller(
 
 
 # Internal only:
-def download_and_stream_latest_job_log(
+def download_and_stream_job_log(
         backend: 'cloud_vm_ray_backend.CloudVmRayBackend',
         handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
-        local_dir: str) -> Optional[str]:
+        local_dir: str,
+        job_ids: Optional[List[str]] = None) -> Optional[str]:
     """Downloads and streams the latest job log.
 
     This function is only used by jobs controller and sky serve controller.
@@ -389,7 +416,7 @@ def download_and_stream_latest_job_log(
             # multi-node cluster is preempted, and we recover the managed job
             # on the existing cluster, which leads to a larger job_id. Those
             # job_ids all represent the same logical managed job.
-            job_ids=None,
+            job_ids=job_ids,
             local_dir=local_dir)
     except Exception as e:  # pylint: disable=broad-except
         # We want to avoid crashing the controller. sync_down_logs() is pretty
@@ -407,7 +434,7 @@ def download_and_stream_latest_job_log(
         return None
 
     log_dir = list(log_dirs.values())[0]
-    log_file = os.path.join(log_dir, 'run.log')
+    log_file = os.path.expanduser(os.path.join(log_dir, 'run.log'))
 
     # Print the logs to the console.
     # TODO(zhwu): refactor this into log_utils, along with the refactoring for
@@ -474,7 +501,7 @@ def shared_controller_vars_to_fill(
     env_vars.update({
         # Should not use $USER here, as that env var can be empty when
         # running in a container.
-        constants.USER_ENV_VAR: getpass.getuser(),
+        constants.USER_ENV_VAR: common_utils.get_current_user_name(),
         constants.USER_ID_ENV_VAR: common_utils.get_user_hash(),
         # Skip cloud identity check to avoid the overhead.
         env_options.Options.SKIP_CLOUD_IDENTITY_CHECK.env_key: '1',
@@ -517,6 +544,30 @@ def get_controller_resources(
         if custom_controller_resources_config is not None:
             controller_resources_config_copied.update(
                 custom_controller_resources_config)
+        # Compatibility with the old way of specifying the controller autostop
+        # config. TODO(cooperc): Remove this before 0.12.0.
+        custom_controller_autostop_config = skypilot_config.get_nested(
+            (controller.value.controller_type, 'controller', 'autostop'), None)
+        if custom_controller_autostop_config is not None:
+            logger.warning(
+                f'{colorama.Fore.YELLOW}Warning: Config value '
+                f'`{controller.value.controller_type}.controller.autostop` '
+                'is deprecated. Please use '
+                f'`{controller.value.controller_type}.controller.resources.'
+                f'autostop` instead.{colorama.Style.RESET_ALL}')
+            # Only set the autostop config if it is not already specified.
+            if controller_resources_config_copied.get('autostop') is None:
+                controller_resources_config_copied['autostop'] = (
+                    custom_controller_autostop_config)
+            else:
+                logger.warning(f'{colorama.Fore.YELLOW}Ignoring the old '
+                               'config, since it is already specified in '
+                               f'resources.{colorama.Style.RESET_ALL}')
+    # Set the default autostop config for the controller, if not already
+    # specified.
+    if controller_resources_config_copied.get('autostop') is None:
+        controller_resources_config_copied['autostop'] = (
+            controller.value.default_autostop_config)
 
     try:
         controller_resources = resources.Resources.from_yaml_config(
@@ -547,7 +598,10 @@ def get_controller_resources(
     if controller_record is not None:
         handle = controller_record.get('handle', None)
         if handle is not None:
-            controller_resources_to_use = handle.launched_resources
+            # Use the existing resources, but override the autostop config with
+            # the one currently specified in the config.
+            controller_resources_to_use = handle.launched_resources.copy(
+                autostop=controller_resources_config_copied.get('autostop'))
 
     # If the controller and replicas are from the same cloud (and region/zone),
     # it should provide better connectivity. We will let the controller choose
@@ -608,8 +662,9 @@ def get_controller_resources(
     controller_zone = controller_resources_to_use.zone
 
     # Filter clouds if controller_resources_to_use.cloud is specified.
-    filtered_clouds = ({controller_cloud} if controller_cloud is not None else
-                       requested_clouds_with_region_zone.keys())
+    filtered_clouds: Set[str] = {controller_cloud
+                                } if controller_cloud is not None else set(
+                                    requested_clouds_with_region_zone.keys())
 
     # Filter regions and zones and construct the result.
     result: Set[resources.Resources] = set()
@@ -618,15 +673,17 @@ def get_controller_resources(
                                                         {None: {None}})
 
         # Filter regions if controller_resources_to_use.region is specified.
-        filtered_regions = ({controller_region} if controller_region is not None
-                            else regions.keys())
+        filtered_regions: Set[Optional[str]] = ({
+            controller_region
+        } if controller_region is not None else set(regions.keys()))
 
         for region in filtered_regions:
             zones = regions.get(region, {None})
 
             # Filter zones if controller_resources_to_use.zone is specified.
-            filtered_zones = ({controller_zone}
-                              if controller_zone is not None else zones)
+            filtered_zones: Set[Optional[str]] = ({
+                controller_zone
+            } if controller_zone is not None else set(zones))
 
             # Create combinations of cloud, region, and zone.
             for zone in filtered_zones:
@@ -639,40 +696,6 @@ def get_controller_resources(
     if not result:
         return {controller_resources_to_use}
     return result
-
-
-def get_controller_autostop_config(
-        controller: Controllers) -> Tuple[Optional[int], bool]:
-    """Get the autostop config for the controller.
-
-    Returns:
-      A tuple of (idle_minutes_to_autostop, down), which correspond to the
-      values passed to execution.launch().
-    """
-    controller_autostop_config_copied: Dict[str, Any] = copy.copy(
-        controller.value.default_autostop_config)
-    if skypilot_config.loaded():
-        custom_controller_autostop_config = skypilot_config.get_nested(
-            (controller.value.controller_type, 'controller', 'autostop'), None)
-        if custom_controller_autostop_config is False:
-            # Disabled with `autostop: false` in config.
-            # To indicate autostop is disabled, we return None for
-            # idle_minutes_to_autostop.
-            return None, False
-        elif custom_controller_autostop_config is True:
-            # Enabled with default values. There is no change in behavior, but
-            # this is included by for completeness, since `False` is valid.
-            pass
-        elif custom_controller_autostop_config is not None:
-            # We have specific config values.
-            # Override the controller autostop config with the ones specified in
-            # the config.
-            assert isinstance(custom_controller_autostop_config, dict)
-            controller_autostop_config_copied.update(
-                custom_controller_autostop_config)
-
-    return (controller_autostop_config_copied['idle_minutes'],
-            controller_autostop_config_copied['down'])
 
 
 def _setup_proxy_command_on_controller(
@@ -703,7 +726,7 @@ def _setup_proxy_command_on_controller(
     # NOTE: suppose that we have a controller in old VPC, then user
     # changes 'vpc_name' in the config and does a 'job launch' /
     # 'serve up'. In general, the old controller may not successfully
-    # launch the job in the new VPC. This happens if the two VPCs don’t
+    # launch the job in the new VPC. This happens if the two VPCs don't
     # have peering set up. Like other places in the code, we assume
     # properly setting up networking is user's responsibilities.
     # TODO(zongheng): consider adding a basic check that checks
@@ -714,7 +737,11 @@ def _setup_proxy_command_on_controller(
     config = config_utils.Config.from_dict(user_config)
     proxy_command_key = (str(controller_launched_cloud).lower(),
                          'ssh_proxy_command')
-    ssh_proxy_command = config.get_nested(proxy_command_key, None)
+    ssh_proxy_command = skypilot_config.get_effective_region_config(
+        cloud=str(controller_launched_cloud).lower(),
+        region=None,
+        keys=('ssh_proxy_command',),
+        default_value=None)
     if isinstance(ssh_proxy_command, str):
         config.set_nested(proxy_command_key, None)
     elif isinstance(ssh_proxy_command, dict):
@@ -789,7 +816,7 @@ def translate_local_file_mounts_to_two_hop(
     file_mount_id = 0
 
     file_mounts_to_translate = task.file_mounts or {}
-    if task.workdir is not None:
+    if task.workdir is not None and isinstance(task.workdir, str):
         file_mounts_to_translate[constants.SKY_REMOTE_WORKDIR] = task.workdir
         task.workdir = None
 
@@ -857,7 +884,8 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
         copy_mounts = {}
 
     has_local_source_paths_file_mounts = bool(copy_mounts)
-    has_local_source_paths_workdir = task.workdir is not None
+    has_local_source_paths_workdir = (task.workdir is not None and
+                                      isinstance(task.workdir, str))
 
     msg = None
     if has_local_source_paths_workdir and has_local_source_paths_file_mounts:
@@ -905,7 +933,7 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
 
     # Step 1: Translate the workdir to SkyPilot storage.
     new_storage_mounts = {}
-    if task.workdir is not None:
+    if task.workdir is not None and isinstance(task.workdir, str):
         workdir = task.workdir
         task.workdir = None
         if (constants.SKY_REMOTE_WORKDIR in original_file_mounts or

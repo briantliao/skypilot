@@ -1,4 +1,5 @@
 """ReplicaManager: handles the creation and deletion of endpoint replicas."""
+import collections
 import dataclasses
 import enum
 import functools
@@ -23,6 +24,7 @@ from sky import execution
 from sky import global_user_state
 from sky import sky_logging
 from sky.backends import backend_utils
+from sky.jobs import scheduler as jobs_scheduler
 from sky.serve import constants as serve_constants
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -34,6 +36,7 @@ from sky.usage import usage_lib
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import env_options
+from sky.utils import resources_utils
 from sky.utils import status_lib
 from sky.utils import ux_utils
 
@@ -45,8 +48,6 @@ logger = sky_logging.init_logger(__name__)
 
 _JOB_STATUS_FETCH_INTERVAL = 30
 _PROCESS_POOL_REFRESH_INTERVAL = 20
-# TODO(tian): Maybe let user determine this threshold
-_CONSECUTIVE_FAILURE_THRESHOLD_TIMEOUT = 180
 _RETRY_INIT_GAP_SECONDS = 60
 _DEFAULT_DRAIN_SECONDS = 120
 
@@ -58,7 +59,7 @@ _MAX_NUM_LAUNCH = psutil.cpu_count() * 2
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 def launch_cluster(replica_id: int,
-                   task_yaml_path: str,
+                   service_task_yaml_path: str,
                    cluster_name: str,
                    resources_override: Optional[Dict[str, Any]] = None,
                    retry_until_up: bool = True,
@@ -78,7 +79,8 @@ def launch_cluster(replica_id: int,
                     f'{cluster_name} with resources override: '
                     f'{resources_override}')
     try:
-        config = common_utils.read_yaml(os.path.expanduser(task_yaml_path))
+        config = common_utils.read_yaml(
+            os.path.expanduser(service_task_yaml_path))
         task = sky.Task.from_yaml_config(config)
         if resources_override is not None:
             resources = task.resources
@@ -173,17 +175,19 @@ def terminate_cluster(cluster_name: str,
             time.sleep(gap_seconds)
 
 
-def _get_resources_ports(task_yaml: str) -> str:
+def _get_resources_ports(service_task_yaml_path: str) -> str:
     """Get the resources ports used by the task."""
-    task = sky.Task.from_yaml(task_yaml)
+    task = sky.Task.from_yaml(service_task_yaml_path)
     # Already checked all ports are valid in sky.serve.core.up
     assert task.resources, task
     assert task.service is not None, task
+    if task.service.pool:
+        return '-'
     assert task.service.ports is not None, task
     return task.service.ports
 
 
-def _should_use_spot(task_yaml: str,
+def _should_use_spot(service_task_yaml_path: str,
                      resource_override: Optional[Dict[str, Any]]) -> bool:
     """Get whether the task should use spot."""
     if resource_override is not None:
@@ -191,7 +195,7 @@ def _should_use_spot(task_yaml: str,
         if use_spot_override is not None:
             assert isinstance(use_spot_override, bool)
             return use_spot_override
-    task = sky.Task.from_yaml(task_yaml)
+    task = sky.Task.from_yaml(service_task_yaml_path)
     spot_use_resources = [
         resources for resources in task.resources if resources.use_spot
     ]
@@ -444,8 +448,8 @@ class ReplicaInfo:
             return None
         replica_port_int = int(self.replica_port)
         try:
-            endpoint_dict = core.endpoints(handle.cluster_name,
-                                           replica_port_int)
+            endpoint_dict = backend_utils.get_endpoints(handle.cluster_name,
+                                                        replica_port_int)
         except exceptions.ClusterNotUpError:
             return None
         endpoint = endpoint_dict.get(replica_port_int, None)
@@ -465,7 +469,9 @@ class ReplicaInfo:
                          f'replica {self.replica_id}.')
         return replica_status
 
-    def to_info_dict(self, with_handle: bool) -> Dict[str, Any]:
+    def to_info_dict(self,
+                     with_handle: bool,
+                     with_url: bool = True) -> Dict[str, Any]:
         cluster_record = global_user_state.get_cluster_from_name(
             self.cluster_name)
         info_dict = {
@@ -473,18 +479,26 @@ class ReplicaInfo:
             'name': self.cluster_name,
             'status': self.status,
             'version': self.version,
-            'endpoint': self.url,
+            'endpoint': self.url if with_url else None,
             'is_spot': self.is_spot,
             'launched_at': (cluster_record['launched_at']
                             if cluster_record is not None else None),
         }
         if with_handle:
-            info_dict['handle'] = self.handle(cluster_record)
+            handle = self.handle(cluster_record)
+            info_dict['handle'] = handle
+            if handle is not None:
+                info_dict['cloud'] = repr(handle.launched_resources.cloud)
+                info_dict['region'] = handle.launched_resources.region
+                info_dict['resources_str'] = (
+                    resources_utils.get_readable_resources_repr(handle,
+                                                                simplify=True))
         return info_dict
 
     def __repr__(self) -> str:
-        info_dict = self.to_info_dict(
-            with_handle=env_options.Options.SHOW_DEBUG_INFO.get())
+        show_details = env_options.Options.SHOW_DEBUG_INFO.get()
+        info_dict = self.to_info_dict(with_handle=show_details,
+                                      with_url=show_details)
         handle_str = ''
         if 'handle' in info_dict:
             handle_str = f', handle={info_dict["handle"]}'
@@ -497,6 +511,33 @@ class ReplicaInfo:
                 f'status={self.status}, '
                 f'launched_at={info_dict["launched_at"]}{handle_str})')
         return info
+
+    def probe_pool(self) -> Tuple['ReplicaInfo', bool, float]:
+        """Probe the replica for pool management.
+
+        This function will check the first job status of the cluster, which is a
+        dummy job that only echoes "setup done". The success of this job means
+        the setup command is done and the replica is ready to be used. Check
+        sky/serve/server/core.py::up for more details.
+
+        Returns:
+            Tuple of (self, is_ready, probe_time).
+        """
+        probe_time = time.time()
+        try:
+            handle = backend_utils.check_cluster_available(
+                self.cluster_name, operation='probing pool')
+            if handle is None:
+                return self, False, probe_time
+            backend = backend_utils.get_backend_from_handle(handle)
+            statuses = backend.get_job_status(handle, [1], stream_logs=False)
+            if statuses[1] == job_lib.JobStatus.SUCCEEDED:
+                return self, True, probe_time
+            return self, False, probe_time
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'Error when probing pool of {self.cluster_name}: '
+                         f'{common_utils.format_exception(e)}.')
+            return self, False, probe_time
 
     def probe(
         self,
@@ -587,6 +628,7 @@ class ReplicaManager:
         self._service_name: str = service_name
         self._uptime: Optional[float] = None
         self._update_mode = serve_utils.DEFAULT_UPDATE_MODE
+        self._is_pool: bool = spec.pool
         header_keys = None
         if spec.readiness_headers is not None:
             header_keys = list(spec.readiness_headers.keys())
@@ -599,6 +641,15 @@ class ReplicaManager:
         self.latest_version: int = serve_constants.INITIAL_VERSION
         # Oldest version among the currently provisioned and launched replicas
         self.least_recent_version: int = serve_constants.INITIAL_VERSION
+
+    def _consecutive_failure_threshold_timeout(self) -> int:
+        """The timeout for the consecutive failure threshold in seconds.
+
+        We reduce the timeout for pool to 10 seconds to make the pool more
+        responsive to the failure.
+        """
+        # TODO(tian): Maybe let user determine this threshold
+        return 10 if self._is_pool else 180
 
     def scale_up(self,
                  resources_override: Optional[Dict[str, Any]] = None) -> None:
@@ -634,10 +685,10 @@ class SkyPilotReplicaManager(ReplicaManager):
     """
 
     def __init__(self, service_name: str, spec: 'service_spec.SkyServiceSpec',
-                 task_yaml_path: str) -> None:
+                 service_task_yaml_path: str) -> None:
         super().__init__(service_name, spec)
-        self._task_yaml_path = task_yaml_path
-        task = sky.Task.from_yaml(task_yaml_path)
+        self.service_task_yaml_path = service_task_yaml_path
+        task = sky.Task.from_yaml(service_task_yaml_path)
         self._spot_placer: Optional[spot_placer.SpotPlacer] = (
             spot_placer.SpotPlacer.from_task(spec, task))
         # TODO(tian): Store launch/down pid in the replica table, to make the
@@ -714,7 +765,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._service_name, replica_id)
         log_file_name = serve_utils.generate_replica_launch_log_file_name(
             self._service_name, replica_id)
-        use_spot = _should_use_spot(self._task_yaml_path, resources_override)
+        use_spot = _should_use_spot(self.service_task_yaml_path,
+                                    resources_override)
         retry_until_up = True
         location = None
         if use_spot and self._spot_placer is not None:
@@ -742,10 +794,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 launch_cluster,
                 log_file_name,
             ).run,
-            args=(replica_id, self._task_yaml_path, cluster_name,
+            args=(replica_id, self.service_task_yaml_path, cluster_name,
                   resources_override, retry_until_up),
         )
-        replica_port = _get_resources_ports(self._task_yaml_path)
+        replica_port = _get_resources_ports(self.service_task_yaml_path)
 
         info = ReplicaInfo(replica_id, cluster_name, replica_port, use_spot,
                            location, self.latest_version, resources_override)
@@ -820,9 +872,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert isinstance(handle, backends.CloudVmRayResourceHandle)
             replica_job_logs_dir = os.path.join(constants.SKY_LOGS_DIRECTORY,
                                                 'replica_jobs')
-            job_log_file_name = (
-                controller_utils.download_and_stream_latest_job_log(
-                    backend, handle, replica_job_logs_dir))
+            job_log_file_name = (controller_utils.download_and_stream_job_log(
+                backend, handle, replica_job_logs_dir))
             if job_log_file_name is not None:
                 logger.info(f'\n== End of logs (Replica: {replica_id}) ==')
                 with open(log_file_name, 'a',
@@ -935,6 +986,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._service_name, replica_id)
                 assert info is not None, replica_id
                 error_in_sky_launch = False
+                schedule_next_jobs = False
                 if info.status == serve_state.ReplicaStatus.PENDING:
                     # sky.launch not started yet
                     if (serve_state.total_number_provisioning_replicas() <
@@ -963,6 +1015,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     else:
                         info.status_property.sky_launch_status = (
                             ProcessStatus.SUCCEEDED)
+                        schedule_next_jobs = True
                     if self._spot_placer is not None and info.is_spot:
                         # TODO(tian): Currently, we set the location to
                         # preemptive if the launch process failed. This is
@@ -982,6 +1035,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                             self._spot_placer.set_active(location)
                 serve_state.add_or_update_replica(self._service_name,
                                                   replica_id, info)
+                if schedule_next_jobs and self._is_pool:
+                    jobs_scheduler.maybe_schedule_next_jobs(
+                        pool=self._service_name)
                 if error_in_sky_launch:
                     # Teardown after update replica info since
                     # _terminate_replica will update the replica info too.
@@ -1098,9 +1154,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             handle = info.handle()
             assert handle is not None, info
             # Use None to fetch latest job, which stands for user task job
+            job_ids = [1] if self._is_pool else None
             try:
                 job_statuses = backend.get_job_status(handle,
-                                                      None,
+                                                      job_ids,
                                                       stream_logs=False)
             except exceptions.CommandError:
                 # If the job status fetch failed, it is likely that the
@@ -1110,7 +1167,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 # Re-raise the exception if it is not preempted.
                 raise
-            job_status = list(job_statuses.values())[0]
+            job_status = job_statuses[1] if self._is_pool else list(
+                job_statuses.values())[0]
             if job_status in job_lib.JobStatus.user_code_failure_states():
                 info.status_property.user_app_failed = True
                 serve_state.add_or_update_replica(self._service_name,
@@ -1154,18 +1212,24 @@ class SkyPilotReplicaManager(ReplicaManager):
             for info in infos:
                 if not info.status_property.should_track_service_status():
                     continue
-                replica_to_probe.append(
-                    f'replica_{info.replica_id}(url={info.url})')
-                probe_futures.append(
-                    pool.apply_async(
-                        info.probe,
-                        (
-                            self._get_readiness_path(info.version),
-                            self._get_post_data(info.version),
-                            self._get_readiness_timeout_seconds(info.version),
-                            self._get_readiness_headers(info.version),
-                        ),
-                    ),)
+                if self._is_pool:
+                    replica_to_probe.append(f'replica_{info.replica_id}(cluster'
+                                            f'_name={info.cluster_name})')
+                    probe_futures.append(pool.apply_async(info.probe_pool))
+                else:
+                    replica_to_probe.append(
+                        f'replica_{info.replica_id}(url={info.url})')
+                    probe_futures.append(
+                        pool.apply_async(
+                            info.probe,
+                            (
+                                self._get_readiness_path(info.version),
+                                self._get_post_data(info.version),
+                                self._get_readiness_timeout_seconds(
+                                    info.version),
+                                self._get_readiness_headers(info.version),
+                            ),
+                        ),)
             logger.info(f'Replicas to probe: {", ".join(replica_to_probe)}')
 
             # Since futures.as_completed will return futures in the order of
@@ -1202,8 +1266,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         consecutive_failure_time = (
                             info.consecutive_failure_times[-1] -
                             info.consecutive_failure_times[0])
-                        if (consecutive_failure_time >=
-                                _CONSECUTIVE_FAILURE_THRESHOLD_TIMEOUT):
+                        failure_threshold = (
+                            self._consecutive_failure_threshold_timeout())
+                        if consecutive_failure_time >= failure_threshold:
                             logger.info(
                                 f'Replica {info.replica_id} is not ready for '
                                 'too long and exceeding consecutive failure '
@@ -1214,8 +1279,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 f'Replica {info.replica_id} is not ready '
                                 'but within consecutive failure threshold '
                                 f'({consecutive_failure_time}s / '
-                                f'{_CONSECUTIVE_FAILURE_THRESHOLD_TIMEOUT}s). '
-                                'Skipping.')
+                                f'{failure_threshold}s). Skipping.')
                     else:
                         initial_delay_seconds = self._get_initial_delay_seconds(
                             info.version)
@@ -1290,11 +1354,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.error(f'Invalid version: {version}, '
                          f'latest version: {self.latest_version}')
             return
-        task_yaml_path = serve_utils.generate_task_yaml_file_name(
+        service_task_yaml_path = serve_utils.generate_task_yaml_file_name(
             self._service_name, version)
         serve_state.add_or_update_version(self._service_name, version, spec)
         self.latest_version = version
-        self._task_yaml_path = task_yaml_path
+        self.service_task_yaml_path = service_task_yaml_path
         self._update_mode = update_mode
 
         # Reuse all replicas that have the same config as the new version
@@ -1302,32 +1366,43 @@ class SkyPilotReplicaManager(ReplicaManager):
         # the latest version. This can significantly improve the speed
         # for updating an existing service with only config changes to the
         # service specs, e.g. scale down the service.
-        new_config = common_utils.read_yaml(os.path.expanduser(task_yaml_path))
+        new_config = common_utils.read_yaml(
+            os.path.expanduser(service_task_yaml_path))
         # Always create new replicas and scale down old ones when file_mounts
         # are not empty.
         if new_config.get('file_mounts', None) != {}:
             return
-        for key in ['service']:
-            new_config.pop(key)
+        for key in ['service', 'pool', '_user_specified_yaml']:
+            new_config.pop(key, None)
+        new_config_any_of = new_config.get('resources', {}).pop('any_of', [])
+
         replica_infos = serve_state.get_replica_infos(self._service_name)
         for info in replica_infos:
             if info.version < version and not info.is_terminal:
                 # Assume user does not change the yaml file on the controller.
-                old_task_yaml_path = serve_utils.generate_task_yaml_file_name(
-                    self._service_name, info.version)
+                old_service_task_yaml_path = (
+                    serve_utils.generate_task_yaml_file_name(
+                        self._service_name, info.version))
                 old_config = common_utils.read_yaml(
-                    os.path.expanduser(old_task_yaml_path))
-                for key in ['service']:
-                    old_config.pop(key)
+                    os.path.expanduser(old_service_task_yaml_path))
+                for key in ['service', 'pool', '_user_specified_yaml']:
+                    old_config.pop(key, None)
                 # Bump replica version if all fields except for service are
                 # the same.
                 # Here, we manually convert the any_of field to a set to avoid
                 # only the difference in the random order of the any_of fields.
                 old_config_any_of = old_config.get('resources',
                                                    {}).pop('any_of', [])
-                new_config_any_of = new_config.get('resources',
-                                                   {}).pop('any_of', [])
-                if set(old_config_any_of) != set(new_config_any_of):
+
+                def normalize_dict_list(lst):
+                    return collections.Counter(
+                        frozenset(d.items()) for d in lst)
+
+                if (normalize_dict_list(old_config_any_of) !=
+                        normalize_dict_list(new_config_any_of)):
+                    logger.info('Replica config changed (any_of), skipping. '
+                                f'old: {old_config_any_of}, '
+                                f'new: {new_config_any_of}')
                     continue
                 # File mounts should both be empty, as update always
                 # create new buckets if they are not empty.
@@ -1341,6 +1416,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     info.version = version
                     serve_state.add_or_update_replica(self._service_name,
                                                       info.replica_id, info)
+                else:
+                    logger.info('Replica config changed (rest), skipping. '
+                                f'old: {old_config}, '
+                                f'new: {new_config}')
 
     def _get_version_spec(self, version: int) -> 'service_spec.SkyServiceSpec':
         spec = serve_state.get_spec(self._service_name, version)
